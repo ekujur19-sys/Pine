@@ -17,6 +17,10 @@
 
 strategy("ICT Entry Models - 2022 Model & Unicorn Setup", shorttitle = "ICT 2022/Unicorn", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, default_qty_type = strategy.percent_of_equity, default_qty_value = 10, initial_capital = 10000, commission_type = strategy.commission.percent, commission_value = 0.02, slippage = 1)
 
+// Satisfies Pine's "must contain at least one output call" requirement up
+// front, so a partial paste still compiles and reveals the real problem.
+plot(close, title = "Close", display = display.none)
+
 // ---------------------------------- Inputs ----------------------------------
 grpModel = "Model Selection"
 tradeModel     = input.string("Both", "ICT Entry Model", options = ["2022 Model", "Unicorn Model", "Both"], group = grpModel)
