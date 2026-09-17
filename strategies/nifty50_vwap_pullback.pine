@@ -1,0 +1,219 @@
+//@version=6
+// =============================================================================
+// Nifty 50 — VWAP Trend Pullback
+// -----------------------------------------------------------------------------
+// Institutional intraday flow in NIFTY anchors to session VWAP: on trending
+// days price holds one side of it and keeps retesting it. This strategy does
+// not trade the VWAP cross (that whipsaws); it waits for an established side,
+// a pullback INTO the VWAP band, and a rejection candle back in the direction
+// of the trend.
+//
+// Best fit : 5m or 15m chart
+// Regime   : VWAP slope + price side of VWAP, optionally an EMA confirmation
+// Entry    : pullback to within X × ATR of VWAP, then a reclaim bar
+// Exit     : ATR stop under the pullback swing, R-multiple target, square-off
+// =============================================================================
+
+strategy(
+     title                   = "Nifty 50 VWAP Pullback",
+     shorttitle              = "NIFTY VWAP PB",
+     overlay                 = true,
+     initial_capital         = 500000,
+     currency                = currency.INR,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 75,
+     pyramiding              = 0,
+     commission_type         = strategy.commission.cash_per_order,
+     commission_value        = 25,
+     slippage                = 2,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     margin_long             = 20,
+     margin_short            = 20)
+
+tz = "Asia/Kolkata"
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+gTrend    = "Trend definition"
+slopeLen  = input.int(10, "VWAP slope lookback (bars)", minval = 1, group = gTrend)
+minSlope  = input.float(0.02, "Minimum VWAP slope (% over lookback)", minval = 0, step = 0.01, group = gTrend,
+     tooltip = "Keeps you out of flat, chop-prone sessions where VWAP is horizontal.")
+useEma    = input.bool(true, "Confirm with EMA", group = gTrend)
+emaLen    = input.int(20, "EMA length", minval = 2, group = gTrend)
+
+gPullback = "Pullback"
+atrLen    = input.int(14, "ATR length", minval = 1, group = gPullback)
+touchMul  = input.float(0.35, "Pullback zone (× ATR from VWAP)", minval = 0.05, step = 0.05, group = gPullback,
+     tooltip = "How close price must come to VWAP to count as a pullback.")
+maxStretch= input.float(2.5, "Max extension from VWAP at entry (× ATR)", minval = 0.5, step = 0.25, group = gPullback,
+     tooltip = "Refuses entries that are already far from VWAP — those are chases.")
+lookback  = input.int(6, "Bars pullback stays valid", minval = 1, maxval = 30, group = gPullback)
+
+gEntry    = "Entries"
+entryWin  = input.session("0930-1430", "Entry window", group = gEntry)
+maxTrades = input.int(3, "Max entries per day", minval = 1, maxval = 10, group = gEntry)
+allowLong = input.bool(true, "Allow longs",  group = gEntry)
+allowShort= input.bool(true, "Allow shorts", group = gEntry)
+
+gExit     = "Exits"
+stopMul   = input.float(1.5, "Stop (× ATR beyond pullback extreme)", minval = 0.2, step = 0.1, group = gExit)
+rrTarget  = input.float(2.0, "Target (R multiple)", minval = 0.5, step = 0.25, group = gExit)
+useVwapStop = input.bool(true, "Exit if price closes back through VWAP", group = gExit)
+sqOffStr  = input.session("1515-1525", "Square-off window", group = gExit)
+
+gSize     = "Position sizing"
+sizeMode  = input.string("Risk %", "Sizing mode", options = ["Risk %", "Fixed lots"], group = gSize)
+riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval = 0.05, step = 0.05, group = gSize)
+lotSize   = input.int(75, "Lot size", minval = 1, group = gSize)
+fixedLots = input.int(1, "Fixed lots", minval = 1, group = gSize)
+maxLots   = input.int(10, "Max lots", minval = 1, group = gSize)
+
+// -----------------------------------------------------------------------------
+// Core series
+// -----------------------------------------------------------------------------
+vwapVal = ta.vwap(hlc3)
+atr     = ta.atr(atrLen)
+ema     = ta.ema(close, emaLen)
+
+slopePct = (vwapVal - vwapVal[slopeLen]) / vwapVal[slopeLen] * 100.0
+
+inEntry = not na(time(timeframe.period, entryWin, tz))
+inSqOff = not na(time(timeframe.period, sqOffStr, tz))
+newDay  = ta.change(time("D")) != 0
+
+var int tradesToday = 0
+if newDay
+    tradesToday := 0
+
+upTrend   = close > vwapVal and slopePct >=  minSlope and (not useEma or close > ema)
+downTrend = close < vwapVal and slopePct <= -minSlope and (not useEma or close < ema)
+
+// -----------------------------------------------------------------------------
+// Pullback tracking — price must visit the VWAP zone, then push back off it
+// -----------------------------------------------------------------------------
+zone = touchMul * atr
+
+touchedLong  = upTrend   and low  <= vwapVal + zone
+touchedShort = downTrend and high >= vwapVal - zone
+
+var int   barsSinceLongTouch  = 999
+var int   barsSinceShortTouch = 999
+var float pullbackLow         = na
+var float pullbackHigh        = na
+
+firstLongTouch  = touchedLong  and not touchedLong[1]
+firstShortTouch = touchedShort and not touchedShort[1]
+
+if touchedLong
+    barsSinceLongTouch := 0
+    pullbackLow := firstLongTouch or na(pullbackLow) ? low : math.min(pullbackLow, low)
+else
+    barsSinceLongTouch := barsSinceLongTouch + 1
+
+if touchedShort
+    barsSinceShortTouch := 0
+    pullbackHigh := firstShortTouch or na(pullbackHigh) ? high : math.max(pullbackHigh, high)
+else
+    barsSinceShortTouch := barsSinceShortTouch + 1
+
+// A trend break invalidates the stored pullback
+if not upTrend
+    pullbackLow := na
+    barsSinceLongTouch := 999
+if not downTrend
+    pullbackHigh := na
+    barsSinceShortTouch := 999
+
+// Rejection / reclaim bar: closes back up (down) and above (below) the prior bar
+bullBar = close > open and close > high[1] - (high[1] - low[1]) * 0.25
+bearBar = close < open and close < low[1]  + (high[1] - low[1]) * 0.25
+
+stretch = math.abs(close - vwapVal) / atr
+
+readyToTrade = inEntry and not inSqOff and strategy.position_size == 0 and
+     tradesToday < maxTrades and barstate.isconfirmed and stretch <= maxStretch
+
+longSetup  = allowLong  and readyToTrade and upTrend   and barsSinceLongTouch  <= lookback and
+     bullBar and not na(pullbackLow)
+shortSetup = allowShort and readyToTrade and downTrend and barsSinceShortTouch <= lookback and
+     bearBar and not na(pullbackHigh)
+
+// -----------------------------------------------------------------------------
+// Sizing
+// -----------------------------------------------------------------------------
+qtyFor(float stopDistance) =>
+    int q = math.min(fixedLots, maxLots) * lotSize
+    if sizeMode == "Risk %" and stopDistance > 0
+        riskAmt  = strategy.equity * riskPct / 100.0
+        rawUnits = riskAmt / stopDistance
+        lots     = math.floor(rawUnits / lotSize)
+        q := math.min(math.max(lots, 0), maxLots) * lotSize
+    q
+
+// -----------------------------------------------------------------------------
+// Entries
+// -----------------------------------------------------------------------------
+var float stopLevel   = na
+var float targetLevel = na
+
+if longSetup
+    sl   = pullbackLow - stopMul * atr
+    dist = close - sl
+    qty  = qtyFor(dist)
+    if dist > 0 and qty > 0
+        strategy.entry("VWAP Long", strategy.long, qty = qty)
+        stopLevel   := sl
+        targetLevel := close + rrTarget * dist
+        tradesToday += 1
+
+if shortSetup
+    sl   = pullbackHigh + stopMul * atr
+    dist = sl - close
+    qty  = qtyFor(dist)
+    if dist > 0 and qty > 0
+        strategy.entry("VWAP Short", strategy.short, qty = qty)
+        stopLevel   := sl
+        targetLevel := close - rrTarget * dist
+        tradesToday += 1
+
+// -----------------------------------------------------------------------------
+// Exits
+// -----------------------------------------------------------------------------
+if strategy.position_size > 0
+    strategy.exit("VWAP Long exit", from_entry = "VWAP Long", stop = stopLevel, limit = targetLevel)
+    if useVwapStop and close < vwapVal
+        strategy.close("VWAP Long", comment = "Lost VWAP")
+
+if strategy.position_size < 0
+    strategy.exit("VWAP Short exit", from_entry = "VWAP Short", stop = stopLevel, limit = targetLevel)
+    if useVwapStop and close > vwapVal
+        strategy.close("VWAP Short", comment = "Reclaimed VWAP")
+
+if strategy.position_size == 0
+    stopLevel   := na
+    targetLevel := na
+
+if inSqOff and strategy.position_size != 0
+    strategy.close_all(comment = "Square off")
+
+// -----------------------------------------------------------------------------
+// Plots
+// -----------------------------------------------------------------------------
+plot(vwapVal, "VWAP", color = color.new(color.blue, 0), linewidth = 2)
+plot(vwapVal + zone, "Zone +", color = color.new(color.blue, 70))
+plot(vwapVal - zone, "Zone -", color = color.new(color.blue, 70))
+plot(useEma ? ema : na, "EMA", color = color.new(color.orange, 0))
+plot(strategy.position_size != 0 ? stopLevel   : na, "Stop",   color = color.new(color.red, 0),   style = plot.style_linebr)
+plot(strategy.position_size != 0 ? targetLevel : na, "Target", color = color.new(color.green, 0), style = plot.style_linebr)
+
+bgcolor(upTrend ? color.new(color.green, 93) : downTrend ? color.new(color.red, 93) : na, title = "Regime")
+
+plotshape(longSetup,  "Long setup",  style = shape.triangleup,   location = location.belowbar,
+     color = color.new(color.green, 0), size = size.tiny)
+plotshape(shortSetup, "Short setup", style = shape.triangledown, location = location.abovebar,
+     color = color.new(color.red, 0),   size = size.tiny)
+
+alertcondition(longSetup,  "VWAP pullback long",  "NIFTY VWAP pullback long @ {{close}}")
+alertcondition(shortSetup, "VWAP pullback short", "NIFTY VWAP pullback short @ {{close}}")

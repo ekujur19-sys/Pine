@@ -1,0 +1,206 @@
+//@version=6
+// =============================================================================
+// Nifty 50 — Opening Range Breakout (ORB)
+// -----------------------------------------------------------------------------
+// The classic Indian index intraday setup. NIFTY opens on a gap far more often
+// than it opens flat, and the first 15–30 minutes usually define the day's
+// value area. This strategy marks that range, then trades the first clean
+// break of it, with the opposite side of the range as the structural stop.
+//
+// Best fit : 5m chart (1m is too noisy, 15m gives too few bars to manage)
+// Range    : 0915-0930 (tight, more signals) or 0915-0945 (fewer, cleaner)
+// Filters  : minimum range width, maximum range width, trade cap per day,
+//            optional prior-day-close bias, mandatory square-off
+// =============================================================================
+
+strategy(
+     title                   = "Nifty 50 Opening Range Breakout",
+     shorttitle              = "NIFTY ORB",
+     overlay                 = true,
+     initial_capital         = 500000,
+     currency                = currency.INR,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 75,
+     pyramiding              = 0,
+     commission_type         = strategy.commission.cash_per_order,
+     commission_value        = 25,
+     slippage                = 2,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     margin_long             = 20,
+     margin_short            = 20)
+
+tz = "Asia/Kolkata"
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+gRange    = "Opening range"
+orSession = input.session("0915-0930", "Opening range window", group = gRange)
+buffTicks = input.float(0.10, "Breakout buffer (% of range)", minval = 0, step = 0.05, group = gRange,
+     tooltip = "Price must clear the range edge by this fraction of the range width. Filters out ticks that just kiss the level.")
+minRangePct = input.float(0.15, "Minimum range width (% of price)", minval = 0, step = 0.05, group = gRange,
+     tooltip = "Skip days where the opening range is so tight that the breakout is noise.")
+maxRangePct = input.float(1.20, "Maximum range width (% of price)", minval = 0.1, step = 0.1, group = gRange,
+     tooltip = "Skip gap-and-shock days where the range is already a full day's move.")
+
+gEntry    = "Entries"
+entryWin  = input.session("0930-1430", "Breakout entry window", group = gEntry)
+maxTrades = input.int(2, "Max entries per day", minval = 1, maxval = 5, group = gEntry)
+allowLong = input.bool(true,  "Allow longs",  group = gEntry)
+allowShort= input.bool(true,  "Allow shorts", group = gEntry)
+useBias   = input.bool(false, "Require close beyond previous day close", group = gEntry,
+     tooltip = "Longs only if price is above yesterday's close, shorts only if below. Cuts trade count, raises hit rate.")
+
+gExit     = "Exits"
+stopMode  = input.string("Opposite range edge", "Stop placement",
+     options = ["Opposite range edge", "Range midpoint", "ATR"], group = gExit)
+atrLen    = input.int(14, "ATR length", minval = 1, group = gExit)
+atrStopMul= input.float(1.5, "ATR stop multiple", minval = 0.2, step = 0.1, group = gExit)
+rrTarget  = input.float(2.0, "Target (R multiple)", minval = 0.5, step = 0.25, group = gExit)
+useTrail  = input.bool(true, "Trail stop after 1R", group = gExit)
+trailMul  = input.float(2.0, "Trail (× ATR)", minval = 0.2, step = 0.1, group = gExit)
+sqOffStr  = input.session("1515-1525", "Square-off window", group = gExit)
+
+gSize     = "Position sizing"
+sizeMode  = input.string("Risk %", "Sizing mode", options = ["Risk %", "Fixed lots"], group = gSize)
+riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval = 0.05, step = 0.05, group = gSize)
+lotSize   = input.int(75, "Lot size", minval = 1, group = gSize)
+fixedLots = input.int(1, "Fixed lots", minval = 1, group = gSize)
+maxLots   = input.int(10, "Max lots", minval = 1, group = gSize)
+
+// -----------------------------------------------------------------------------
+// Session state
+// -----------------------------------------------------------------------------
+atr      = ta.atr(atrLen)
+prevDayClose = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_on)
+
+inOR     = not na(time(timeframe.period, orSession, tz))
+inEntry  = not na(time(timeframe.period, entryWin, tz))
+inSqOff  = not na(time(timeframe.period, sqOffStr, tz))
+newDay   = ta.change(time("D")) != 0
+
+var float orHigh     = na
+var float orLow      = na
+var bool  orComplete = false
+var int   tradesToday= 0
+
+if newDay
+    orHigh      := na
+    orLow       := na
+    orComplete  := false
+    tradesToday := 0
+
+if inOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow,  low)
+else if not na(orHigh) and not orComplete
+    orComplete := true
+
+orWidth    = na(orHigh) or na(orLow) ? na : orHigh - orLow
+orWidthPct = na(orWidth) ? na : orWidth / close * 100.0
+widthOk    = not na(orWidthPct) and orWidthPct >= minRangePct and orWidthPct <= maxRangePct
+buffer     = na(orWidth) ? na : orWidth * buffTicks
+
+// -----------------------------------------------------------------------------
+// Signals
+// -----------------------------------------------------------------------------
+biasLong  = not useBias or close > prevDayClose
+biasShort = not useBias or close < prevDayClose
+
+readyToTrade = orComplete and widthOk and inEntry and not inSqOff and
+     strategy.position_size == 0 and tradesToday < maxTrades and barstate.isconfirmed
+
+longBreak  = allowLong  and readyToTrade and biasLong  and close > orHigh + buffer
+shortBreak = allowShort and readyToTrade and biasShort and close < orLow  - buffer
+
+// -----------------------------------------------------------------------------
+// Sizing
+// -----------------------------------------------------------------------------
+qtyFor(float stopDistance) =>
+    int q = math.min(fixedLots, maxLots) * lotSize
+    if sizeMode == "Risk %" and stopDistance > 0
+        riskAmt  = strategy.equity * riskPct / 100.0
+        rawUnits = riskAmt / stopDistance          // 1 index point = INR 1 per unit
+        lots     = math.floor(rawUnits / lotSize)
+        q := math.min(math.max(lots, 0), maxLots) * lotSize
+    q
+
+stopLevelFor(bool isLong) =>
+    float lvl = na
+    if stopMode == "Opposite range edge"
+        lvl := isLong ? orLow : orHigh
+    else if stopMode == "Range midpoint"
+        lvl := (orHigh + orLow) / 2.0
+    else
+        lvl := isLong ? close - atrStopMul * atr : close + atrStopMul * atr
+    lvl
+
+// -----------------------------------------------------------------------------
+// Entries
+// -----------------------------------------------------------------------------
+var float riskPerUnit = na
+var float stopLevel   = na
+var float targetLevel = na
+
+if longBreak
+    sl   = stopLevelFor(true)
+    dist = close - sl
+    qty  = qtyFor(dist)
+    if dist > 0 and qty > 0
+        strategy.entry("ORB Long", strategy.long, qty = qty)
+        riskPerUnit := dist
+        stopLevel   := sl
+        targetLevel := close + rrTarget * dist
+        tradesToday += 1
+
+if shortBreak
+    sl   = stopLevelFor(false)
+    dist = sl - close
+    qty  = qtyFor(dist)
+    if dist > 0 and qty > 0
+        strategy.entry("ORB Short", strategy.short, qty = qty)
+        riskPerUnit := dist
+        stopLevel   := sl
+        targetLevel := close - rrTarget * dist
+        tradesToday += 1
+
+// -----------------------------------------------------------------------------
+// Exit management
+// -----------------------------------------------------------------------------
+if strategy.position_size > 0
+    avg = strategy.position_avg_price
+    if useTrail and not na(riskPerUnit) and close >= avg + riskPerUnit
+        stopLevel := math.max(nz(stopLevel, avg), avg, close - trailMul * atr)
+    strategy.exit("ORB Long exit", from_entry = "ORB Long", stop = stopLevel, limit = targetLevel)
+
+if strategy.position_size < 0
+    avg = strategy.position_avg_price
+    if useTrail and not na(riskPerUnit) and close <= avg - riskPerUnit
+        stopLevel := math.min(nz(stopLevel, avg), avg, close + trailMul * atr)
+    strategy.exit("ORB Short exit", from_entry = "ORB Short", stop = stopLevel, limit = targetLevel)
+
+if strategy.position_size == 0
+    stopLevel   := na
+    targetLevel := na
+    riskPerUnit := na
+
+if inSqOff and strategy.position_size != 0
+    strategy.close_all(comment = "Square off")
+
+// -----------------------------------------------------------------------------
+// Plots
+// -----------------------------------------------------------------------------
+plot(orComplete ? orHigh : na, "OR High", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+plot(orComplete ? orLow  : na, "OR Low",  color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? stopLevel   : na, "Stop",   color = color.new(color.red, 0),   style = plot.style_linebr)
+plot(strategy.position_size != 0 ? targetLevel : na, "Target", color = color.new(color.green, 0), style = plot.style_linebr)
+bgcolor(inOR ? color.new(color.blue, 90) : na, title = "Opening range")
+
+plotshape(longBreak,  "Long break",  style = shape.triangleup,   location = location.belowbar,
+     color = color.new(color.green, 0), size = size.tiny)
+plotshape(shortBreak, "Short break", style = shape.triangledown, location = location.abovebar,
+     color = color.new(color.red, 0),   size = size.tiny)
+
+alertcondition(longBreak,  "ORB long",  "NIFTY ORB long break @ {{close}}")
+alertcondition(shortBreak, "ORB short", "NIFTY ORB short break @ {{close}}")

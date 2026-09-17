@@ -1,0 +1,190 @@
+//@version=6
+// =============================================================================
+// Nifty 50 — EMA Trend + ADX Strength Strategy (ATR risk model)
+// -----------------------------------------------------------------------------
+// Designed for NSE:NIFTY / NIFTY futures on intraday (5m–60m) or daily charts.
+// Logic:
+//   Regime : price above/below a slow trend EMA
+//   Entry  : fast EMA crosses slow EMA in the direction of the regime,
+//            confirmed by ADX above a threshold (trend is actually moving)
+//   Exit   : ATR initial stop, ATR chandelier trail, optional R-multiple target,
+//            optional intraday square-off before the close
+//   Size   : risk a fixed % of equity per trade, rounded down to whole lots
+// =============================================================================
+
+strategy(
+     title                 = "Nifty 50 Trend Strategy (EMA + ADX + ATR)",
+     shorttitle            = "NIFTY Trend",
+     overlay               = true,
+     initial_capital       = 500000,
+     currency              = currency.INR,
+     default_qty_type      = strategy.fixed,
+     default_qty_value     = 75,
+     pyramiding            = 0,
+     commission_type       = strategy.commission.cash_per_order,
+     commission_value      = 25,
+     slippage              = 2,
+     process_orders_on_close = true,
+     calc_on_every_tick    = false,
+     margin_long           = 20,
+     margin_short          = 20)
+
+// ----------------------------------------------------------------------------- 
+// Inputs
+// -----------------------------------------------------------------------------
+gTrend   = "Trend"
+fastLen  = input.int(20,  "Fast EMA",        minval = 2,  group = gTrend)
+slowLen  = input.int(50,  "Slow EMA",        minval = 3,  group = gTrend)
+regimeLen= input.int(200, "Regime EMA",      minval = 10, group = gTrend)
+useRegime= input.bool(true, "Only trade in the direction of the regime EMA", group = gTrend)
+
+gAdx     = "Trend strength"
+diLen    = input.int(14, "DI length",        minval = 1, group = gAdx)
+adxSmooth= input.int(14, "ADX smoothing",    minval = 1, group = gAdx)
+adxMin   = input.float(20.0, "Minimum ADX",  minval = 0, step = 0.5, group = gAdx)
+useAdx   = input.bool(true, "Require ADX filter", group = gAdx)
+
+gRisk    = "Risk & exits"
+atrLen   = input.int(14,  "ATR length",      minval = 1, group = gRisk)
+stopMult = input.float(2.0, "Initial stop (× ATR)",  minval = 0.2, step = 0.1, group = gRisk)
+trailMult= input.float(3.0, "Trail stop (× ATR)",    minval = 0.2, step = 0.1, group = gRisk)
+useTarget= input.bool(true, "Use fixed R target",    group = gRisk)
+rrTarget = input.float(3.0, "Target (R multiple)",   minval = 0.5, step = 0.5, group = gRisk)
+
+gSize    = "Position sizing"
+sizeMode = input.string("Risk %", "Sizing mode", options = ["Risk %", "Fixed lots"], group = gSize)
+riskPct  = input.float(1.0, "Risk per trade (% of equity)", minval = 0.05, step = 0.05, group = gSize)
+lotSize  = input.int(75, "Lot size (units per lot)", minval = 1, group = gSize)
+fixedLots= input.int(1,  "Fixed lots",               minval = 1, group = gSize)
+maxLots  = input.int(10, "Max lots per trade",       minval = 1, group = gSize)
+
+gSess    = "Session (IST)"
+useSess  = input.bool(true, "Restrict entries to session", group = gSess)
+sessStr  = input.session("0920-1500", "Entry window", group = gSess)
+sqOff    = input.bool(true, "Square off intraday positions", group = gSess)
+sqOffStr = input.session("1515-1530", "Square-off window", group = gSess)
+
+gSide    = "Direction"
+allowLong  = input.bool(true, "Allow longs",  group = gSide)
+allowShort = input.bool(true, "Allow shorts", group = gSide)
+
+// -----------------------------------------------------------------------------
+// Indicators
+// -----------------------------------------------------------------------------
+emaFast   = ta.ema(close, fastLen)
+emaSlow   = ta.ema(close, slowLen)
+emaRegime = ta.ema(close, regimeLen)
+atr       = ta.atr(atrLen)
+[diPlus, diMinus, adx] = ta.dmi(diLen, adxSmooth)
+
+tz        = "Asia/Kolkata"
+inSession = not useSess or not na(time(timeframe.period, sessStr, tz))
+inSqOff   = timeframe.isintraday and sqOff and not na(time(timeframe.period, sqOffStr, tz))
+
+// -----------------------------------------------------------------------------
+// Signals
+// -----------------------------------------------------------------------------
+adxOk      = not useAdx or adx >= adxMin
+regimeLong = not useRegime or close > emaRegime
+regimeShort= not useRegime or close < emaRegime
+
+longSignal  = allowLong  and ta.crossover(emaFast, emaSlow)  and regimeLong  and adxOk and diPlus  > diMinus
+shortSignal = allowShort and ta.crossunder(emaFast, emaSlow) and regimeShort and adxOk and diMinus > diPlus
+
+canEnter = inSession and not inSqOff and strategy.position_size == 0 and barstate.isconfirmed
+
+// -----------------------------------------------------------------------------
+// Position sizing — risk a fixed % of equity across the ATR stop distance
+// -----------------------------------------------------------------------------
+qtyFor(float stopDistance) =>
+    int q = fixedLots * lotSize
+    if sizeMode == "Risk %" and stopDistance > 0
+        riskAmt   = strategy.equity * riskPct / 100.0
+        rawUnits  = riskAmt / stopDistance          // 1 index point = INR 1 per unit
+        lots      = math.floor(rawUnits / lotSize)
+        q := math.min(math.max(lots, 0), maxLots) * lotSize
+    else
+        q := math.min(fixedLots, maxLots) * lotSize
+    q
+
+// -----------------------------------------------------------------------------
+// Entries
+// -----------------------------------------------------------------------------
+var float entryAtr  = na
+var float trailStop = na
+
+stopDist = stopMult * atr
+
+if canEnter and longSignal
+    qty = qtyFor(stopDist)
+    if qty > 0
+        strategy.entry("Long", strategy.long, qty = qty)
+        entryAtr  := atr
+        trailStop := na
+
+if canEnter and shortSignal
+    qty = qtyFor(stopDist)
+    if qty > 0
+        strategy.entry("Short", strategy.short, qty = qty)
+        entryAtr  := atr
+        trailStop := na
+
+// -----------------------------------------------------------------------------
+// Exit management — initial ATR stop that ratchets into a chandelier trail
+// -----------------------------------------------------------------------------
+float longTarget  = na
+float shortTarget = na
+
+if strategy.position_size > 0
+    avg     = strategy.position_avg_price
+    initial = avg - stopMult * nz(entryAtr, atr)
+    cand    = close - trailMult * atr
+    trailStop := na(trailStop) ? initial : math.max(trailStop, cand, initial)
+    longTarget := useTarget ? avg + rrTarget * stopMult * nz(entryAtr, atr) : na
+    strategy.exit("Long exit", from_entry = "Long", stop = trailStop, limit = longTarget)
+
+if strategy.position_size < 0
+    avg     = strategy.position_avg_price
+    initial = avg + stopMult * nz(entryAtr, atr)
+    cand    = close + trailMult * atr
+    trailStop := na(trailStop) ? initial : math.min(trailStop, cand, initial)
+    shortTarget := useTarget ? avg - rrTarget * stopMult * nz(entryAtr, atr) : na
+    strategy.exit("Short exit", from_entry = "Short", stop = trailStop, limit = shortTarget)
+
+if strategy.position_size == 0
+    trailStop := na
+    entryAtr  := na
+
+// Opposite-signal reversal exit (flat first, re-entry happens on the next signal)
+if strategy.position_size > 0 and ta.crossunder(emaFast, emaSlow)
+    strategy.close("Long", comment = "EMA flip")
+if strategy.position_size < 0 and ta.crossover(emaFast, emaSlow)
+    strategy.close("Short", comment = "EMA flip")
+
+// Intraday square-off
+if inSqOff and strategy.position_size != 0
+    strategy.close_all(comment = "Square off")
+
+// -----------------------------------------------------------------------------
+// Plots
+// -----------------------------------------------------------------------------
+plot(emaFast,   "Fast EMA",   color = color.new(color.aqua, 0),   linewidth = 1)
+plot(emaSlow,   "Slow EMA",   color = color.new(color.orange, 0), linewidth = 1)
+plot(useRegime ? emaRegime : na, "Regime EMA", color = color.new(color.gray, 0), linewidth = 2)
+plot(strategy.position_size != 0 ? trailStop : na, "Stop", color = color.new(color.red, 0),
+     style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size > 0 ? longTarget : strategy.position_size < 0 ? shortTarget : na,
+     "Target", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 1)
+
+bgcolor(useSess and not inSession ? color.new(color.gray, 92) : na, title = "Outside session")
+
+plotshape(longSignal  and canEnter, "Long signal",  style = shape.triangleup,
+     location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
+plotshape(shortSignal and canEnter, "Short signal", style = shape.triangledown,
+     location = location.abovebar, color = color.new(color.red, 0),   size = size.tiny)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+alertcondition(longSignal,  "Nifty long entry",  "NIFTY long signal on {{ticker}} @ {{close}}")
+alertcondition(shortSignal, "Nifty short entry", "NIFTY short signal on {{ticker}} @ {{close}}")

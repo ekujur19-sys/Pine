@@ -1,0 +1,192 @@
+//@version=6
+// =============================================================================
+// Nifty 50 — Supertrend Momentum with Squeeze Release
+// -----------------------------------------------------------------------------
+// NIFTY spends most of the session range-bound and then makes one or two real
+// directional legs. This strategy sits out the compression and takes the
+// expansion: it waits for Bollinger/Keltner compression to RELEASE, then
+// enters on the Supertrend flip in the direction of the release, filtered by
+// RSI momentum so it does not buy an exhausted move.
+//
+// Best fit : 5m (aggressive) or 15m (cleaner, ~1 trade/day)
+// Entry    : Supertrend flip + momentum agrees + not inside a squeeze
+// Exit     : Supertrend line as trailing stop, R target, square-off
+// =============================================================================
+
+strategy(
+     title                   = "Nifty 50 Supertrend Momentum",
+     shorttitle              = "NIFTY ST Momo",
+     overlay                 = true,
+     initial_capital         = 500000,
+     currency                = currency.INR,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 75,
+     pyramiding              = 0,
+     commission_type         = strategy.commission.cash_per_order,
+     commission_value        = 25,
+     slippage                = 2,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     margin_long             = 20,
+     margin_short            = 20)
+
+tz = "Asia/Kolkata"
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+gST      = "Supertrend"
+stFactor = input.float(2.5, "Factor", minval = 0.5, step = 0.1, group = gST)
+stAtrLen = input.int(10, "ATR period", minval = 1, group = gST)
+
+gMomo    = "Momentum filter"
+useRsi   = input.bool(true, "Require RSI agreement", group = gMomo)
+rsiLen   = input.int(14, "RSI length", minval = 2, group = gMomo)
+rsiLong  = input.float(52.0, "RSI floor for longs",  minval = 50, maxval = 80, step = 0.5, group = gMomo)
+rsiShort = input.float(48.0, "RSI ceiling for shorts", minval = 20, maxval = 50, step = 0.5, group = gMomo)
+rsiMaxLong  = input.float(78.0, "RSI overbought cut-off", minval = 55, maxval = 95, step = 0.5, group = gMomo,
+     tooltip = "Refuse late longs into an already-extended move.")
+rsiMinShort = input.float(22.0, "RSI oversold cut-off",   minval = 5,  maxval = 45, step = 0.5, group = gMomo)
+
+gSqz     = "Squeeze"
+useSqz   = input.bool(true, "Require squeeze release", group = gSqz,
+     tooltip = "Only take the flip when volatility has just expanded out of compression.")
+bbLen    = input.int(20, "BB length", minval = 2, group = gSqz)
+bbMult   = input.float(2.0, "BB multiplier", minval = 0.5, step = 0.1, group = gSqz)
+kcMult   = input.float(1.5, "Keltner multiplier", minval = 0.5, step = 0.1, group = gSqz)
+sqzGrace = input.int(6, "Bars after release still valid", minval = 1, maxval = 30, group = gSqz)
+
+gEntry   = "Entries"
+entryWin = input.session("0930-1430", "Entry window", group = gEntry)
+maxTrades= input.int(3, "Max entries per day", minval = 1, maxval = 10, group = gEntry)
+allowLong = input.bool(true,  "Allow longs",  group = gEntry)
+allowShort= input.bool(true,  "Allow shorts", group = gEntry)
+
+gExit    = "Exits"
+rrTarget = input.float(2.5, "Target (R multiple)", minval = 0.5, step = 0.25, group = gExit)
+useStTrail = input.bool(true, "Trail on the Supertrend line", group = gExit)
+sqOffStr = input.session("1515-1525", "Square-off window", group = gExit)
+
+gSize    = "Position sizing"
+sizeMode = input.string("Risk %", "Sizing mode", options = ["Risk %", "Fixed lots"], group = gSize)
+riskPct  = input.float(1.0, "Risk per trade (% of equity)", minval = 0.05, step = 0.05, group = gSize)
+lotSize  = input.int(75, "Lot size", minval = 1, group = gSize)
+fixedLots= input.int(1, "Fixed lots", minval = 1, group = gSize)
+maxLots  = input.int(10, "Max lots", minval = 1, group = gSize)
+
+// -----------------------------------------------------------------------------
+// Core series
+// -----------------------------------------------------------------------------
+[stLine, stDir] = ta.supertrend(stFactor, stAtrLen)   // stDir is -1 in an uptrend
+rsi = ta.rsi(close, rsiLen)
+atr = ta.atr(stAtrLen)
+
+basis   = ta.sma(close, bbLen)
+dev     = bbMult * ta.stdev(close, bbLen)
+bbUpper = basis + dev
+bbLower = basis - dev
+kcRange = kcMult * ta.sma(ta.tr(true), bbLen)
+kcUpper = basis + kcRange
+kcLower = basis - kcRange
+
+inSqueeze     = bbUpper < kcUpper and bbLower > kcLower
+squeezeExit   = not inSqueeze and inSqueeze[1]
+barsSinceExit = ta.barssince(squeezeExit)
+squeezeOk     = not useSqz or (not inSqueeze and not na(barsSinceExit) and barsSinceExit <= sqzGrace)
+
+inEntry = not na(time(timeframe.period, entryWin, tz))
+inSqOff = not na(time(timeframe.period, sqOffStr, tz))
+newDay  = ta.change(time("D")) != 0
+
+var int tradesToday = 0
+if newDay
+    tradesToday := 0
+
+flipUp   = stDir < 0 and stDir[1] > 0
+flipDown = stDir > 0 and stDir[1] < 0
+
+rsiLongOk  = not useRsi or (rsi >= rsiLong  and rsi <= rsiMaxLong)
+rsiShortOk = not useRsi or (rsi <= rsiShort and rsi >= rsiMinShort)
+
+readyToTrade = inEntry and not inSqOff and strategy.position_size == 0 and
+     tradesToday < maxTrades and barstate.isconfirmed
+
+longSetup  = allowLong  and readyToTrade and flipUp   and rsiLongOk  and squeezeOk
+shortSetup = allowShort and readyToTrade and flipDown and rsiShortOk and squeezeOk
+
+// -----------------------------------------------------------------------------
+// Sizing
+// -----------------------------------------------------------------------------
+qtyFor(float stopDistance) =>
+    int q = math.min(fixedLots, maxLots) * lotSize
+    if sizeMode == "Risk %" and stopDistance > 0
+        riskAmt  = strategy.equity * riskPct / 100.0
+        rawUnits = riskAmt / stopDistance
+        lots     = math.floor(rawUnits / lotSize)
+        q := math.min(math.max(lots, 0), maxLots) * lotSize
+    q
+
+// -----------------------------------------------------------------------------
+// Entries — the Supertrend line itself is the initial stop
+// -----------------------------------------------------------------------------
+var float stopLevel   = na
+var float targetLevel = na
+
+if longSetup
+    sl   = stLine
+    dist = close - sl
+    qty  = qtyFor(dist)
+    if dist > 0 and qty > 0
+        strategy.entry("ST Long", strategy.long, qty = qty)
+        stopLevel   := sl
+        targetLevel := close + rrTarget * dist
+        tradesToday += 1
+
+if shortSetup
+    sl   = stLine
+    dist = sl - close
+    qty  = qtyFor(dist)
+    if dist > 0 and qty > 0
+        strategy.entry("ST Short", strategy.short, qty = qty)
+        stopLevel   := sl
+        targetLevel := close - rrTarget * dist
+        tradesToday += 1
+
+// -----------------------------------------------------------------------------
+// Exits
+// -----------------------------------------------------------------------------
+if strategy.position_size > 0
+    if useStTrail and stDir < 0
+        stopLevel := math.max(nz(stopLevel, stLine), stLine)
+    strategy.exit("ST Long exit", from_entry = "ST Long", stop = stopLevel, limit = targetLevel)
+    if flipDown
+        strategy.close("ST Long", comment = "ST flip")
+
+if strategy.position_size < 0
+    if useStTrail and stDir > 0
+        stopLevel := math.min(nz(stopLevel, stLine), stLine)
+    strategy.exit("ST Short exit", from_entry = "ST Short", stop = stopLevel, limit = targetLevel)
+    if flipUp
+        strategy.close("ST Short", comment = "ST flip")
+
+if strategy.position_size == 0
+    stopLevel   := na
+    targetLevel := na
+
+if inSqOff and strategy.position_size != 0
+    strategy.close_all(comment = "Square off")
+
+// -----------------------------------------------------------------------------
+// Plots
+// -----------------------------------------------------------------------------
+plot(stLine, "Supertrend", color = stDir < 0 ? color.new(color.green, 0) : color.new(color.red, 0), linewidth = 2)
+plot(strategy.position_size != 0 ? targetLevel : na, "Target", color = color.new(color.green, 0), style = plot.style_linebr)
+bgcolor(inSqueeze ? color.new(color.yellow, 88) : na, title = "Squeeze")
+
+plotshape(longSetup,  "Long",  style = shape.triangleup,   location = location.belowbar,
+     color = color.new(color.green, 0), size = size.tiny)
+plotshape(shortSetup, "Short", style = shape.triangledown, location = location.abovebar,
+     color = color.new(color.red, 0),   size = size.tiny)
+
+alertcondition(longSetup,  "Supertrend long",  "NIFTY Supertrend long @ {{close}}")
+alertcondition(shortSetup, "Supertrend short", "NIFTY Supertrend short @ {{close}}")
