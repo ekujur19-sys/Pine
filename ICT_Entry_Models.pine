@@ -1,38 +1,44 @@
 //@version=6
-// ICT Entry Models — 2022 Model & Unicorn Setup
-// Educational implementation of common retail-ICT concepts: liquidity sweeps,
-// market structure shifts (MSS/CHoCH), fair value gaps (FVG), order blocks
-// and breaker-block/FVG overlap ("Unicorn"). Not official ICT material —
-// definitions below are simplified approximations for automation purposes.
-strategy("ICT Entry Models — 2022 Model & Unicorn Setup", shorttitle = "ICT 2022/Unicorn",
-     overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500,
-     default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
-     initial_capital = 10000, currency = currency.USD,
-     commission_type = strategy.commission.percent, commission_value = 0.02,
-     slippage = 1)
+// ICT Entry Models - 2022 Model & Unicorn Setup
+//
+// Educational implementation of commonly-taught retail-ICT concepts:
+// liquidity sweeps, market structure shifts (MSS / CHoCH), fair value gaps,
+// order blocks, and order-block/FVG overlap ("Unicorn"). These are simplified
+// approximations suitable for automation, not official ICT material.
+//
+// Logic outline:
+//   1. Track swing highs/lows (pivots).
+//   2. Detect a liquidity sweep: wick through a swing point, close back inside.
+//   3. Confirm MSS: a close back through the opposite swing point.
+//   4. Entry zone = FVG (2022 Model) or OB/FVG overlap (Unicorn) formed during
+//      the displacement leg between the sweep and the MSS.
+//   5. Buy/sell limit at the zone midpoint (CE), stop beyond the sweep wick,
+//      target at a fixed R multiple.
 
-// ───────────────────────────── Inputs ─────────────────────────────
+strategy("ICT Entry Models - 2022 Model & Unicorn Setup", shorttitle = "ICT 2022/Unicorn", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, default_qty_type = strategy.percent_of_equity, default_qty_value = 10, initial_capital = 10000, commission_type = strategy.commission.percent, commission_value = 0.02, slippage = 1)
+
+// ---------------------------------- Inputs ----------------------------------
 grpModel = "Model Selection"
 tradeModel     = input.string("Both", "ICT Entry Model", options = ["2022 Model", "Unicorn Model", "Both"], group = grpModel)
 tradeDirection = input.string("Both", "Trade Direction", options = ["Both", "Long Only", "Short Only"], group = grpModel)
 
 grpStruct = "Market Structure"
-swingLen   = input.int(5, "Swing Length (pivot bars each side)", minval = 1, group = grpStruct)
+swingLen    = input.int(5, "Swing Length (pivot bars each side)", minval = 1, group = grpStruct)
 maxWaitBars = input.int(60, "Max Bars to Wait for MSS after Sweep", minval = 5, group = grpStruct)
 
 grpFVG = "Fair Value Gap"
 fvgMinSizeATRmult = input.float(0.0, "Min FVG Size (x ATR)", minval = 0.0, step = 0.1, group = grpFVG)
-fvgMaxAgeBars      = input.int(50, "Max Zone Age (bars)", minval = 5, group = grpFVG)
+fvgMaxAgeBars     = input.int(50, "Max Zone Age (bars)", minval = 5, group = grpFVG)
 
 grpOB = "Order Block / Breaker (Unicorn)"
 obLookback = input.int(6, "OB Search Lookback (bars)", minval = 1, maxval = 20, group = grpOB)
 
 grpSess = "Session / Killzones"
-useKillzones  = input.bool(true, "Only Arm Setups During Killzones", group = grpSess)
-londonKZ      = input.session("0200-0500", "London Killzone", group = grpSess)
-nyamKZ        = input.session("0830-1100", "NY AM Killzone", group = grpSess)
-nypmKZ        = input.session("1330-1600", "NY PM Killzone", group = grpSess)
-sessTimezone  = input.string("America/New_York", "Session Timezone", group = grpSess)
+useKillzones = input.bool(true, "Only Arm Setups During Killzones", group = grpSess)
+londonKZ     = input.session("0200-0500", "London Killzone", group = grpSess)
+nyamKZ       = input.session("0830-1100", "NY AM Killzone", group = grpSess)
+nypmKZ       = input.session("1330-1600", "NY PM Killzone", group = grpSess)
+sessTimezone = input.string("America/New_York", "Session Timezone", group = grpSess)
 
 grpRisk = "Risk Management"
 slBufferATRmult = input.float(0.1, "SL Buffer (x ATR)", minval = 0.0, step = 0.05, group = grpRisk)
@@ -41,131 +47,160 @@ useEquityRisk   = input.bool(true, "Size by % Risk per Trade", group = grpRisk)
 riskPercent     = input.float(1.0, "Risk % per Trade", minval = 0.1, step = 0.1, group = grpRisk)
 
 grpDisp = "Display"
-showFVG     = input.bool(true, "Show FVG Zones", group = grpDisp)
-showOB      = input.bool(true, "Show Order Blocks / Unicorn Zones", group = grpDisp)
-showSweeps  = input.bool(true, "Show Liquidity Sweeps", group = grpDisp)
-showMSS     = input.bool(true, "Show Market Structure Shifts", group = grpDisp)
-colBull     = input.color(color.new(color.teal, 75), "Bullish Zone Color", group = grpDisp)
-colBear     = input.color(color.new(color.maroon, 75), "Bearish Zone Color", group = grpDisp)
-colUnicorn  = input.color(color.new(color.purple, 55), "Unicorn Zone Color", group = grpDisp)
+showFVG    = input.bool(true, "Show FVG Zones", group = grpDisp)
+showOB     = input.bool(true, "Show Unicorn (OB + FVG) Zones", group = grpDisp)
+showSweeps = input.bool(true, "Show Liquidity Sweeps", group = grpDisp)
+showMSS    = input.bool(true, "Show Market Structure Shifts", group = grpDisp)
+colBull    = input.color(color.new(color.teal, 80), "Bullish Zone Color", group = grpDisp)
+colBear    = input.color(color.new(color.maroon, 80), "Bearish Zone Color", group = grpDisp)
+colUnicorn = input.color(color.new(color.purple, 60), "Unicorn Zone Color", group = grpDisp)
 
-// ───────────────────────────── Types ─────────────────────────────
-type Zone
-    float top
-    float bottom
-    bool  isBull
-    int   startBar
-    string kind      // "FVG", "OB", "Unicorn"
-    box   b
+// ------------------------------ Zone storage --------------------------------
+// Parallel arrays instead of a user-defined type: zones are appended in
+// chronological order and never removed mid-iteration, only flagged inactive.
+var array<float>  zoneTop      = array.new_float()
+var array<float>  zoneBot      = array.new_float()
+var array<bool>   zoneIsBull   = array.new_bool()
+var array<int>    zoneStartBar = array.new_int()
+var array<string> zoneKind     = array.new_string()
+var array<bool>   zoneActive   = array.new_bool()
+var array<box>    zoneBox      = array.new_box()
 
-var array<Zone> zones = array.new<Zone>()
-
-// ───────────────────────────── Helpers ─────────────────────────────
 atr = ta.atr(14)
 
-inKillzone = not na(time(timeframe.period, londonKZ, sessTimezone)) or
-             not na(time(timeframe.period, nyamKZ, sessTimezone)) or
-             not na(time(timeframe.period, nypmKZ, sessTimezone))
+inKillzone = not na(time(timeframe.period, londonKZ, sessTimezone)) or not na(time(timeframe.period, nyamKZ, sessTimezone)) or not na(time(timeframe.period, nypmKZ, sessTimezone))
 
-f_findOB(wantBearish, fromOffset, maxLookback) =>
-    int foundOffset = na
+// ------------------------------- Helpers ------------------------------------
+// Order block search. Each returns a single value and indexes history only
+// with the loop counter, which is always a valid history-reference offset.
+f_obTop(wantBearish, fromOffset, maxLookback) =>
+    float r = na
     for i = fromOffset to fromOffset + maxLookback
-        bool isBearish = close[i] < open[i]
-        bool isBullish = close[i] > open[i]
-        bool match = wantBearish ? isBearish : isBullish
-        if match and na(foundOffset)
-            foundOffset := i
-    float obTop = na(foundOffset) ? na : high[foundOffset]
-    float obBot = na(foundOffset) ? na : low[foundOffset]
-    [obTop, obBot, foundOffset]
+        bool hit = wantBearish ? close[i] < open[i] : close[i] > open[i]
+        if na(r) and hit
+            r := high[i]
+    r
 
-f_pruneZones(maxAge) =>
-    if array.size(zones) > 0
-        for i = array.size(zones) - 1 to 0
-            z = array.get(zones, i)
-            box.set_right(z.b, bar_index)
-            bool expired   = (bar_index - z.startBar) > maxAge
-            bool mitigated = z.isBull ? close < z.bottom : close > z.top
-            if expired or mitigated
-                box.delete(z.b)
-                array.remove(zones, i)
+f_obBot(wantBearish, fromOffset, maxLookback) =>
+    float r = na
+    for i = fromOffset to fromOffset + maxLookback
+        bool hit = wantBearish ? close[i] < open[i] : close[i] > open[i]
+        if na(r) and hit
+            r := low[i]
+    r
 
-f_scanZone(kindWanted, isBullWanted, fromBar, toBar) =>
-    float rTop = na
-    float rBot = na
-    if array.size(zones) > 0
-        for i = 0 to array.size(zones) - 1
-            z = array.get(zones, i)
-            if na(rTop) and z.kind == kindWanted and z.isBull == isBullWanted and z.startBar >= fromBar and z.startBar <= toBar
-                rTop := z.top
-                rBot := z.bottom
-    [rTop, rBot]
+f_obBar(wantBearish, fromOffset, maxLookback) =>
+    int r = -1
+    for i = fromOffset to fromOffset + maxLookback
+        bool hit = wantBearish ? close[i] < open[i] : close[i] > open[i]
+        if r == -1 and hit
+            r := bar_index - i
+    r
 
-// ───────────────────────────── FVG / OB / Unicorn detection ─────────────────────────────
+f_addZone(kind, zTop, zBot, isBull, startBar, leftBar, col) =>
+    box bx = box.new(leftBar, zTop, bar_index, zBot, border_color = color.new(color.gray, 100), bgcolor = col)
+    array.push(zoneTop, zTop)
+    array.push(zoneBot, zBot)
+    array.push(zoneIsBull, isBull)
+    array.push(zoneStartBar, startBar)
+    array.push(zoneKind, kind)
+    array.push(zoneActive, true)
+    array.push(zoneBox, bx)
+
+// Returns the index of the oldest matching active zone, or -1 when none match.
+f_findZoneIdx(kindWanted, isBullWanted, fromBar, toBar) =>
+    int idx = -1
+    if array.size(zoneKind) > 0
+        for i = 0 to array.size(zoneKind) - 1
+            if idx == -1 and array.get(zoneActive, i) and array.get(zoneKind, i) == kindWanted and array.get(zoneIsBull, i) == isBullWanted and array.get(zoneStartBar, i) >= fromBar and array.get(zoneStartBar, i) <= toBar
+                idx := i
+    idx
+
+f_qty(entryP, slP) =>
+    float dist = math.abs(entryP - slP)
+    float q = na
+    if dist > 0
+        q := (strategy.equity * riskPercent / 100) / dist
+    q
+
+// --------------------- FVG / Unicorn zone detection -------------------------
 bool bullGap = low > high[2]
 bool bearGap = high < low[2]
 
 if bullGap and (low - high[2]) >= fvgMinSizeATRmult * atr
-    float top = low
-    float bot = high[2]
-    if showFVG
-        bx = box.new(bar_index - 2, top, bar_index, bot, border_color = na, bgcolor = colBull)
-        array.push(zones, Zone.new(top, bot, true, bar_index - 1, "FVG", bx))
-    else
-        array.push(zones, Zone.new(top, bot, true, bar_index - 1, "FVG", box.new(bar_index - 2, top, bar_index, bot, border_color = na, bgcolor = color.new(color.white, 100))))
-    [obTop, obBot, obOff] = f_findOB(true, 2, obLookback)
-    if not na(obOff)
-        float ovTop = math.min(top, obTop)
-        float ovBot = math.max(bot, obBot)
+    float gTop = low
+    float gBot = high[2]
+    f_addZone("FVG", gTop, gBot, true, bar_index - 1, bar_index - 2, showFVG ? colBull : color.new(color.gray, 100))
+    // Bullish OB = last down-close candle before the displacement leg.
+    float obT = f_obTop(true, 2, obLookback)
+    float obB = f_obBot(true, 2, obLookback)
+    int   obX = f_obBar(true, 2, obLookback)
+    if obX >= 0
+        float ovTop = math.min(gTop, obT)
+        float ovBot = math.max(gBot, obB)
         if ovTop > ovBot
-            if showOB
-                ubx = box.new(bar_index - obOff, ovTop, bar_index, ovBot, border_color = color.purple, bgcolor = colUnicorn)
-                array.push(zones, Zone.new(ovTop, ovBot, true, bar_index - 1, "Unicorn", ubx))
-            else
-                array.push(zones, Zone.new(ovTop, ovBot, true, bar_index - 1, "Unicorn", box.new(bar_index - obOff, ovTop, bar_index, ovBot, border_color = na, bgcolor = color.new(color.white, 100))))
+            f_addZone("Unicorn", ovTop, ovBot, true, bar_index - 1, obX, showOB ? colUnicorn : color.new(color.gray, 100))
 
 if bearGap and (low[2] - high) >= fvgMinSizeATRmult * atr
-    float top = low[2]
-    float bot = high
-    if showFVG
-        bx = box.new(bar_index - 2, top, bar_index, bot, border_color = na, bgcolor = colBear)
-        array.push(zones, Zone.new(top, bot, false, bar_index - 1, "FVG", bx))
-    else
-        array.push(zones, Zone.new(top, bot, false, bar_index - 1, "FVG", box.new(bar_index - 2, top, bar_index, bot, border_color = na, bgcolor = color.new(color.white, 100))))
-    [obTop, obBot, obOff] = f_findOB(false, 2, obLookback)
-    if not na(obOff)
-        float ovTop = math.min(top, obTop)
-        float ovBot = math.max(bot, obBot)
+    float gTop = low[2]
+    float gBot = high
+    f_addZone("FVG", gTop, gBot, false, bar_index - 1, bar_index - 2, showFVG ? colBear : color.new(color.gray, 100))
+    // Bearish OB = last up-close candle before the displacement leg.
+    float obT = f_obTop(false, 2, obLookback)
+    float obB = f_obBot(false, 2, obLookback)
+    int   obX = f_obBar(false, 2, obLookback)
+    if obX >= 0
+        float ovTop = math.min(gTop, obT)
+        float ovBot = math.max(gBot, obB)
         if ovTop > ovBot
-            if showOB
-                ubx = box.new(bar_index - obOff, ovTop, bar_index, ovBot, border_color = color.purple, bgcolor = colUnicorn)
-                array.push(zones, Zone.new(ovTop, ovBot, false, bar_index - 1, "Unicorn", ubx))
+            f_addZone("Unicorn", ovTop, ovBot, false, bar_index - 1, obX, showOB ? colUnicorn : color.new(color.gray, 100))
+
+// ------------------------- Zone maintenance ---------------------------------
+// Forward-only pass: extend live zones, retire expired or mitigated ones.
+if array.size(zoneTop) > 0
+    for i = 0 to array.size(zoneTop) - 1
+        if array.get(zoneActive, i)
+            float zT = array.get(zoneTop, i)
+            float zB = array.get(zoneBot, i)
+            bool  zBull = array.get(zoneIsBull, i)
+            int   zBar = array.get(zoneStartBar, i)
+            box   zBx = array.get(zoneBox, i)
+            bool expired = (bar_index - zBar) > fvgMaxAgeBars
+            bool mitigated = zBull ? close < zB : close > zT
+            if expired or mitigated
+                box.delete(zBx)
+                array.set(zoneActive, i, false)
             else
-                array.push(zones, Zone.new(ovTop, ovBot, false, bar_index - 1, "Unicorn", box.new(bar_index - obOff, ovTop, bar_index, ovBot, border_color = na, bgcolor = color.new(color.white, 100))))
+                box.set_right(zBx, bar_index)
 
-f_pruneZones(math.max(fvgMaxAgeBars, obLookback + 10))
+// Bound memory: drop the oldest entries once the history grows large.
+if array.size(zoneTop) > 300
+    for i = 1 to 100
+        box.delete(array.shift(zoneBox))
+        array.shift(zoneTop)
+        array.shift(zoneBot)
+        array.shift(zoneIsBull)
+        array.shift(zoneStartBar)
+        array.shift(zoneKind)
+        array.shift(zoneActive)
 
-// ───────────────────────────── Swing structure ─────────────────────────────
+// --------------------------- Swing structure --------------------------------
 ph = ta.pivothigh(swingLen, swingLen)
 pl = ta.pivotlow(swingLen, swingLen)
 
 var float swingHighVal   = na
-var int   swingHighBar   = na
 var bool  swingHighTaken = false
 var float swingLowVal    = na
-var int   swingLowBar    = na
 var bool  swingLowTaken  = false
 
 if not na(ph)
-    swingHighVal   := ph
-    swingHighBar   := bar_index - swingLen
+    swingHighVal := ph
     swingHighTaken := false
 if not na(pl)
-    swingLowVal   := pl
-    swingLowBar   := bar_index - swingLen
+    swingLowVal := pl
     swingLowTaken := false
 
-// ───────────────────────────── Liquidity sweep detection ─────────────────────────────
+// ------------------------ Liquidity sweep detection -------------------------
 var bool  awaitingBullishMSS = false
 var float bullishSweepLevel  = na
 var int   bullishSweepBar    = na
@@ -176,195 +211,183 @@ var float bearishSweepLevel  = na
 var int   bearishSweepBar    = na
 var float bearishMSSTarget   = na
 
-bool sweepLow  = not na(swingLowVal)  and not swingLowTaken  and low  < swingLowVal  and close > swingLowVal  and (not useKillzones or inKillzone)
-bool sweepHigh = not na(swingHighVal) and not swingHighTaken and high > swingHighVal and close < swingHighVal and (not useKillzones or inKillzone)
+bool armed = not useKillzones or inKillzone
+bool sweepLow  = not na(swingLowVal) and not swingLowTaken and low < swingLowVal and close > swingLowVal and armed
+bool sweepHigh = not na(swingHighVal) and not swingHighTaken and high > swingHighVal and close < swingHighVal and armed
 
 if sweepLow
-    swingLowTaken       := true
-    awaitingBullishMSS  := true
-    bullishSweepLevel   := low
-    bullishSweepBar     := bar_index
-    bullishMSSTarget    := swingHighVal
+    swingLowTaken := true
+    awaitingBullishMSS := true
+    bullishSweepLevel := low
+    bullishSweepBar := bar_index
+    // Freeze the structure high to break, so a later pivot cannot shift it.
+    bullishMSSTarget := swingHighVal
     if showSweeps
         label.new(bar_index, low, "SSL Sweep", style = label.style_label_up, color = color.new(color.teal, 20), textcolor = color.white, size = size.tiny)
 
 if sweepHigh
-    swingHighTaken      := true
-    awaitingBearishMSS  := true
-    bearishSweepLevel   := high
-    bearishSweepBar     := bar_index
-    bearishMSSTarget     := swingLowVal
+    swingHighTaken := true
+    awaitingBearishMSS := true
+    bearishSweepLevel := high
+    bearishSweepBar := bar_index
+    bearishMSSTarget := swingLowVal
     if showSweeps
         label.new(bar_index, high, "BSL Sweep", style = label.style_label_down, color = color.new(color.maroon, 20), textcolor = color.white, size = size.tiny)
 
-// timeout abandonment
 if awaitingBullishMSS and (bar_index - bullishSweepBar) > maxWaitBars
     awaitingBullishMSS := false
 if awaitingBearishMSS and (bar_index - bearishSweepBar) > maxWaitBars
     awaitingBearishMSS := false
 
-bool bullishMSSConfirmed = awaitingBullishMSS and not na(bullishMSSTarget) and close > bullishMSSTarget
-bool bearishMSSConfirmed = awaitingBearishMSS and not na(bearishMSSTarget) and close < bearishMSSTarget
+bool bullishMSS = awaitingBullishMSS and not na(bullishMSSTarget) and close > bullishMSSTarget
+bool bearishMSS = awaitingBearishMSS and not na(bearishMSSTarget) and close < bearishMSSTarget
 
-if bullishMSSConfirmed
+if bullishMSS
     awaitingBullishMSS := false
     if showMSS
-        line.new(bullishSweepBar, bullishMSSTarget, bar_index, bullishMSSTarget, color = color.teal, width = 2, extend = extend.none)
+        line.new(bullishSweepBar, bullishMSSTarget, bar_index, bullishMSSTarget, color = color.teal, width = 2)
         label.new(bar_index, bullishMSSTarget, "Bullish MSS", style = label.style_label_down, color = color.teal, textcolor = color.white, size = size.small)
 
-if bearishMSSConfirmed
+if bearishMSS
     awaitingBearishMSS := false
     if showMSS
-        line.new(bearishSweepBar, bearishMSSTarget, bar_index, bearishMSSTarget, color = color.maroon, width = 2, extend = extend.none)
+        line.new(bearishSweepBar, bearishMSSTarget, bar_index, bearishMSSTarget, color = color.maroon, width = 2)
         label.new(bar_index, bearishMSSTarget, "Bearish MSS", style = label.style_label_up, color = color.maroon, textcolor = color.white, size = size.small)
 
-// ───────────────────────────── Pending setup state ─────────────────────────────
-var float p2022LongTop = na
-var float p2022LongBot = na
-var float p2022LongSL = na
-var float p2022LongTP = na
-var bool  p2022LongActive = false
-var int   p2022LongBar = na
+// --------------------------- Pending setups ---------------------------------
+var float p22LongTop = na
+var float p22LongBot = na
+var float p22LongSL = na
+var float p22LongTP = na
+var bool  p22LongOn = false
+var int   p22LongBar = na
 
-var float p2022ShortTop = na
-var float p2022ShortBot = na
-var float p2022ShortSL = na
-var float p2022ShortTP = na
-var bool  p2022ShortActive = false
-var int   p2022ShortBar = na
+var float p22ShortTop = na
+var float p22ShortBot = na
+var float p22ShortSL = na
+var float p22ShortTP = na
+var bool  p22ShortOn = false
+var int   p22ShortBar = na
 
 var float pUniLongTop = na
 var float pUniLongBot = na
 var float pUniLongSL = na
 var float pUniLongTP = na
-var bool  pUniLongActive = false
+var bool  pUniLongOn = false
 var int   pUniLongBar = na
 
 var float pUniShortTop = na
 var float pUniShortBot = na
 var float pUniShortSL = na
 var float pUniShortTP = na
-var bool  pUniShortActive = false
+var bool  pUniShortOn = false
 var int   pUniShortBar = na
 
-bool allowLong  = tradeDirection != "Short Only"
-bool allowShort = tradeDirection != "Long Only"
+bool allowLong    = tradeDirection != "Short Only"
+bool allowShort   = tradeDirection != "Long Only"
 bool allow2022    = tradeModel != "Unicorn Model"
 bool allowUnicorn = tradeModel != "2022 Model"
 bool flat = strategy.position_size == 0
 
-if bullishMSSConfirmed and flat
-    [fvgTop, fvgBot] = f_scanZone("FVG", true, bullishSweepBar, bar_index)
-    [uniTop, uniBot] = f_scanZone("Unicorn", true, bullishSweepBar, bar_index)
-    if allow2022 and allowLong and not na(fvgTop)
-        p2022LongTop := fvgTop
-        p2022LongBot := fvgBot
-        p2022LongSL  := bullishSweepLevel - atr * slBufferATRmult
-        float entryP = (fvgTop + fvgBot) / 2
-        p2022LongTP  := entryP + (entryP - p2022LongSL) * rrRatio
-        p2022LongActive := true
-        p2022LongBar := bar_index
-    if allowUnicorn and allowLong and not na(uniTop)
-        pUniLongTop := uniTop
-        pUniLongBot := uniBot
-        pUniLongSL  := bullishSweepLevel - atr * slBufferATRmult
-        float entryP = (uniTop + uniBot) / 2
-        pUniLongTP  := entryP + (entryP - pUniLongSL) * rrRatio
-        pUniLongActive := true
+if bullishMSS and flat
+    int fvgIdx = f_findZoneIdx("FVG", true, bullishSweepBar, bar_index)
+    int uniIdx = f_findZoneIdx("Unicorn", true, bullishSweepBar, bar_index)
+    if allow2022 and allowLong and fvgIdx >= 0
+        p22LongTop := array.get(zoneTop, fvgIdx)
+        p22LongBot := array.get(zoneBot, fvgIdx)
+        p22LongSL := bullishSweepLevel - atr * slBufferATRmult
+        float e = (p22LongTop + p22LongBot) / 2
+        p22LongTP := e + (e - p22LongSL) * rrRatio
+        p22LongOn := true
+        p22LongBar := bar_index
+    if allowUnicorn and allowLong and uniIdx >= 0
+        pUniLongTop := array.get(zoneTop, uniIdx)
+        pUniLongBot := array.get(zoneBot, uniIdx)
+        pUniLongSL := bullishSweepLevel - atr * slBufferATRmult
+        float e = (pUniLongTop + pUniLongBot) / 2
+        pUniLongTP := e + (e - pUniLongSL) * rrRatio
+        pUniLongOn := true
         pUniLongBar := bar_index
 
-if bearishMSSConfirmed and flat
-    [fvgTop, fvgBot] = f_scanZone("FVG", false, bearishSweepBar, bar_index)
-    [uniTop, uniBot] = f_scanZone("Unicorn", false, bearishSweepBar, bar_index)
-    if allow2022 and allowShort and not na(fvgTop)
-        p2022ShortTop := fvgTop
-        p2022ShortBot := fvgBot
-        p2022ShortSL  := bearishSweepLevel + atr * slBufferATRmult
-        float entryP = (fvgTop + fvgBot) / 2
-        p2022ShortTP  := entryP - (p2022ShortSL - entryP) * rrRatio
-        p2022ShortActive := true
-        p2022ShortBar := bar_index
-    if allowUnicorn and allowShort and not na(uniTop)
-        pUniShortTop := uniTop
-        pUniShortBot := uniBot
-        pUniShortSL  := bearishSweepLevel + atr * slBufferATRmult
-        float entryP = (uniTop + uniBot) / 2
-        pUniShortTP  := entryP - (pUniShortSL - entryP) * rrRatio
-        pUniShortActive := true
+if bearishMSS and flat
+    int fvgIdx = f_findZoneIdx("FVG", false, bearishSweepBar, bar_index)
+    int uniIdx = f_findZoneIdx("Unicorn", false, bearishSweepBar, bar_index)
+    if allow2022 and allowShort and fvgIdx >= 0
+        p22ShortTop := array.get(zoneTop, fvgIdx)
+        p22ShortBot := array.get(zoneBot, fvgIdx)
+        p22ShortSL := bearishSweepLevel + atr * slBufferATRmult
+        float e = (p22ShortTop + p22ShortBot) / 2
+        p22ShortTP := e - (p22ShortSL - e) * rrRatio
+        p22ShortOn := true
+        p22ShortBar := bar_index
+    if allowUnicorn and allowShort and uniIdx >= 0
+        pUniShortTop := array.get(zoneTop, uniIdx)
+        pUniShortBot := array.get(zoneBot, uniIdx)
+        pUniShortSL := bearishSweepLevel + atr * slBufferATRmult
+        float e = (pUniShortTop + pUniShortBot) / 2
+        pUniShortTP := e - (pUniShortSL - e) * rrRatio
+        pUniShortOn := true
         pUniShortBar := bar_index
 
-// ───────────────────────────── Order management ─────────────────────────────
-f_qty(entryP, slP) =>
-    float dist = math.abs(entryP - slP)
-    float q = na
-    if useEquityRisk and dist > 0
-        q := (strategy.equity * riskPercent / 100) / dist
-    q
-
-// cancel / expire helpers
-if p2022LongActive and (close < p2022LongSL or (bar_index - p2022LongBar) > fvgMaxAgeBars or strategy.position_size != 0)
+// -------------------------- Order management --------------------------------
+// Retire a pending setup once its stop is breached before entry, once it grows
+// stale, or once any position is open (cancelling a filled order is a no-op).
+if p22LongOn and (close < p22LongSL or (bar_index - p22LongBar) > fvgMaxAgeBars or not flat)
     strategy.cancel("2022 Long")
-    p2022LongActive := false
-if p2022ShortActive and (close > p2022ShortSL or (bar_index - p2022ShortBar) > fvgMaxAgeBars or strategy.position_size != 0)
+    p22LongOn := false
+if p22ShortOn and (close > p22ShortSL or (bar_index - p22ShortBar) > fvgMaxAgeBars or not flat)
     strategy.cancel("2022 Short")
-    p2022ShortActive := false
-if pUniLongActive and (close < pUniLongSL or (bar_index - pUniLongBar) > fvgMaxAgeBars or strategy.position_size != 0)
+    p22ShortOn := false
+if pUniLongOn and (close < pUniLongSL or (bar_index - pUniLongBar) > fvgMaxAgeBars or not flat)
     strategy.cancel("Unicorn Long")
-    pUniLongActive := false
-if pUniShortActive and (close > pUniShortSL or (bar_index - pUniShortBar) > fvgMaxAgeBars or strategy.position_size != 0)
+    pUniLongOn := false
+if pUniShortOn and (close > pUniShortSL or (bar_index - pUniShortBar) > fvgMaxAgeBars or not flat)
     strategy.cancel("Unicorn Short")
-    pUniShortActive := false
+    pUniShortOn := false
 
-if p2022LongActive and flat
-    float entryP = (p2022LongTop + p2022LongBot) / 2
-    float q = f_qty(entryP, p2022LongSL)
+if p22LongOn and flat
+    float e = (p22LongTop + p22LongBot) / 2
+    float q = f_qty(e, p22LongSL)
     if useEquityRisk and not na(q)
-        strategy.entry("2022 Long", strategy.long, qty = q, limit = entryP)
+        strategy.entry("2022 Long", strategy.long, qty = q, limit = e)
     else
-        strategy.entry("2022 Long", strategy.long, limit = entryP)
-    strategy.exit("2022 Long Exit", "2022 Long", stop = p2022LongSL, limit = p2022LongTP)
+        strategy.entry("2022 Long", strategy.long, limit = e)
+    strategy.exit("2022 Long X", "2022 Long", stop = p22LongSL, limit = p22LongTP)
 
-if p2022ShortActive and flat
-    float entryP = (p2022ShortTop + p2022ShortBot) / 2
-    float q = f_qty(entryP, p2022ShortSL)
+if p22ShortOn and flat
+    float e = (p22ShortTop + p22ShortBot) / 2
+    float q = f_qty(e, p22ShortSL)
     if useEquityRisk and not na(q)
-        strategy.entry("2022 Short", strategy.short, qty = q, limit = entryP)
+        strategy.entry("2022 Short", strategy.short, qty = q, limit = e)
     else
-        strategy.entry("2022 Short", strategy.short, limit = entryP)
-    strategy.exit("2022 Short Exit", "2022 Short", stop = p2022ShortSL, limit = p2022ShortTP)
+        strategy.entry("2022 Short", strategy.short, limit = e)
+    strategy.exit("2022 Short X", "2022 Short", stop = p22ShortSL, limit = p22ShortTP)
 
-if pUniLongActive and flat
-    float entryP = (pUniLongTop + pUniLongBot) / 2
-    float q = f_qty(entryP, pUniLongSL)
+if pUniLongOn and flat
+    float e = (pUniLongTop + pUniLongBot) / 2
+    float q = f_qty(e, pUniLongSL)
     if useEquityRisk and not na(q)
-        strategy.entry("Unicorn Long", strategy.long, qty = q, limit = entryP)
+        strategy.entry("Unicorn Long", strategy.long, qty = q, limit = e)
     else
-        strategy.entry("Unicorn Long", strategy.long, limit = entryP)
-    strategy.exit("Unicorn Long Exit", "Unicorn Long", stop = pUniLongSL, limit = pUniLongTP)
+        strategy.entry("Unicorn Long", strategy.long, limit = e)
+    strategy.exit("Unicorn Long X", "Unicorn Long", stop = pUniLongSL, limit = pUniLongTP)
 
-if pUniShortActive and flat
-    float entryP = (pUniShortTop + pUniShortBot) / 2
-    float q = f_qty(entryP, pUniShortSL)
+if pUniShortOn and flat
+    float e = (pUniShortTop + pUniShortBot) / 2
+    float q = f_qty(e, pUniShortSL)
     if useEquityRisk and not na(q)
-        strategy.entry("Unicorn Short", strategy.short, qty = q, limit = entryP)
+        strategy.entry("Unicorn Short", strategy.short, qty = q, limit = e)
     else
-        strategy.entry("Unicorn Short", strategy.short, limit = entryP)
-    strategy.exit("Unicorn Short Exit", "Unicorn Short", stop = pUniShortSL, limit = pUniShortTP)
+        strategy.entry("Unicorn Short", strategy.short, limit = e)
+    strategy.exit("Unicorn Short X", "Unicorn Short", stop = pUniShortSL, limit = pUniShortTP)
 
-// once a position opens, stop offering the other pending setups of the same bias/model
-if strategy.position_size > 0
-    p2022ShortActive := false
-    pUniShortActive := false
-if strategy.position_size < 0
-    p2022LongActive := false
-    pUniLongActive := false
+// ------------------------------ Plots & alerts ------------------------------
+plotshape(showMSS and bullishMSS, title = "Bullish MSS", style = shape.triangleup, location = location.belowbar, color = color.teal, size = size.tiny)
+plotshape(showMSS and bearishMSS, title = "Bearish MSS", style = shape.triangledown, location = location.abovebar, color = color.maroon, size = size.tiny)
+plotshape(showSweeps and sweepLow, title = "SSL Sweep", style = shape.xcross, location = location.belowbar, color = color.teal, size = size.tiny)
+plotshape(showSweeps and sweepHigh, title = "BSL Sweep", style = shape.xcross, location = location.abovebar, color = color.maroon, size = size.tiny)
 
-// ───────────────────────────── Alerts ─────────────────────────────
-alertcondition(sweepLow,  title = "Sell-Side Liquidity Sweep", message = "Sell-side liquidity swept — bullish setup armed")
-alertcondition(sweepHigh, title = "Buy-Side Liquidity Sweep",  message = "Buy-side liquidity swept — bearish setup armed")
-alertcondition(bullishMSSConfirmed, title = "Bullish MSS", message = "Bullish Market Structure Shift confirmed")
-alertcondition(bearishMSSConfirmed, title = "Bearish MSS", message = "Bearish Market Structure Shift confirmed")
-
-// ───────────────────────────── Plots ─────────────────────────────
-plotshape(showMSS and bullishMSSConfirmed, title = "Bullish MSS Marker", style = shape.triangleup, location = location.belowbar, color = color.teal, size = size.tiny)
-plotshape(showMSS and bearishMSSConfirmed, title = "Bearish MSS Marker", style = shape.triangledown, location = location.abovebar, color = color.maroon, size = size.tiny)
+alertcondition(sweepLow, title = "Sell-Side Liquidity Sweep", message = "Sell-side liquidity swept - bullish setup armed")
+alertcondition(sweepHigh, title = "Buy-Side Liquidity Sweep", message = "Buy-side liquidity swept - bearish setup armed")
+alertcondition(bullishMSS, title = "Bullish MSS", message = "Bullish market structure shift confirmed")
+alertcondition(bearishMSS, title = "Bearish MSS", message = "Bearish market structure shift confirmed")
