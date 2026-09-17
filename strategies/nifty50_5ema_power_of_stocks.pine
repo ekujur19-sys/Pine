@@ -1,0 +1,325 @@
+//@version=6
+// =============================================================================
+// 5 EMA Strategy (Power of Stocks — Subhasish Pani)
+// -----------------------------------------------------------------------------
+// Premise: a candle that closes ENTIRELY away from the 5 EMA is overextended.
+// You fade it by resting an order at the far side of that candle.
+//
+//   SELL setup : candle whose LOW  is fully ABOVE the 5 EMA
+//                -> sell stop at that candle's LOW, SL at its HIGH
+//   BUY  setup : candle whose HIGH is fully BELOW the 5 EMA
+//                -> buy stop at that candle's HIGH, SL at its LOW
+//
+// While the setup stays valid, each new qualifying candle REPLACES the
+// reference candle (trigger and stop both shift). The moment a candle touches
+// the 5 EMA, the setup is dead and the resting order is cancelled.
+//
+// Note on character: in its pure form this is a COUNTER-TREND strategy. A run
+// of candles fully above the 5 EMA is, by definition, a strong uptrend — and
+// the rules short into it. That is where both the outsized winners and the
+// losing streaks come from. `useTrendFilter` lets you test the filtered
+// variant against the pure rules; it is OFF by default so the default is the
+// strategy as taught.
+//
+// Timeframes: 15m/1h intraday, daily/weekly positional. Lower than 15m the
+// 5 EMA is touched constantly and almost no setup survives to trigger.
+// =============================================================================
+
+strategy(
+     title                   = "5 EMA Strategy (Power of Stocks)",
+     shorttitle              = "5 EMA PoS",
+     overlay                 = true,
+     initial_capital         = 500000,
+     currency                = currency.INR,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     pyramiding              = 0,
+     commission_type         = strategy.commission.cash_per_order,
+     commission_value        = 25,
+     slippage                = 2,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     margin_long             = 20,
+     margin_short            = 20)
+
+tz = "Asia/Kolkata"
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+gCore     = "5 EMA core rules"
+emaLen    = input.int(5, "EMA length", minval = 2, group = gCore)
+emaSrc    = input.source(close, "EMA source", group = gCore)
+breakMode = input.string("Wick (resting stop order)", "Break definition",
+     options = ["Wick (resting stop order)", "Candle close beyond level"], group = gCore,
+     tooltip = "Wick = an order rests at the level and fills intrabar, as taught. Close = wait for a full candle to close beyond it. These are materially different strategies: wick triggers far more often and stops out more.")
+shiftRef  = input.bool(true, "Shift reference to each new qualifying candle", group = gCore,
+     tooltip = "ON (as taught): the newest fully-separated candle becomes the reference. OFF: the first one holds until the setup dies.")
+allowLong = input.bool(true, "Allow buy setups",  group = gCore)
+allowShort= input.bool(true, "Allow sell setups", group = gCore)
+
+gQuality  = "Setup quality filters"
+atrLen    = input.int(14, "ATR length", minval = 1, group = gQuality)
+useMaxRange = input.bool(true, "Skip abnormally large reference candles", group = gQuality)
+maxRangeAtr = input.float(3.0, "Max candle range (× ATR)", minval = 0.5, step = 0.25, group = gQuality,
+     tooltip = "The candle's range IS your risk. A huge candle means a huge stop and a tiny position.")
+useMinRange = input.bool(false, "Skip tiny reference candles", group = gQuality)
+minRangeAtr = input.float(0.3, "Min candle range (× ATR)", minval = 0.05, step = 0.05, group = gQuality)
+useGapGuard = input.bool(true, "Cancel if price gaps past the trigger", group = gQuality,
+     tooltip = "Refuses the fill when the open is already beyond the trigger by more than the allowed slip.")
+maxGapAtr = input.float(0.5, "Max gap past trigger (× ATR)", minval = 0, step = 0.1, group = gQuality)
+
+gTrend    = "Optional trend filter (NOT part of the original rules)"
+useTrendFilter = input.bool(false, "Only trade with the higher-timeframe trend", group = gTrend)
+htf       = input.timeframe("D", "Higher timeframe", group = gTrend)
+htfEmaLen = input.int(20, "Higher-timeframe EMA", minval = 2, group = gTrend)
+
+gExit     = "Exits"
+rr1       = input.float(2.0, "Target 1 (R multiple)", minval = 0.5, step = 0.25, group = gExit)
+usePartial= input.bool(true, "Book partial at target 1, trail the rest", group = gExit)
+partialPct= input.int(50, "Partial booked at target 1 (%)", minval = 10, maxval = 90, group = gExit)
+rr2       = input.float(5.0, "Runner target (R multiple)", minval = 1.0, step = 0.5, group = gExit)
+trailOnEma= input.bool(true, "Trail the runner on the 5 EMA", group = gExit)
+useTimeStop = input.bool(false, "Exit if the trade stalls", group = gExit)
+timeStopBars= input.int(20, "Stall exit after N bars", minval = 2, group = gExit)
+
+gSess     = "Session (intraday only)"
+useSqOff  = input.bool(false, "Square off intraday positions", group = gSess,
+     tooltip = "Leave OFF for positional use on daily/weekly. Ignored on non-intraday charts.")
+entryWin  = input.session("0915-1500", "Entry window", group = gSess)
+useEntryWin = input.bool(false, "Restrict entries to the window", group = gSess)
+sqOffStr  = input.session("1515-1525", "Square-off window", group = gSess)
+
+gSize     = "Position sizing"
+sizeMode  = input.string("Risk %", "Sizing mode", options = ["Risk %", "Fixed lots"], group = gSize)
+riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval = 0.05, step = 0.05, group = gSize)
+lotSize   = input.int(1, "Lot size / units per lot", minval = 1, group = gSize,
+     tooltip = "1 for cash stocks. Set to the contract lot size for futures (NIFTY = 75).")
+fixedLots = input.int(1, "Fixed lots", minval = 1, group = gSize)
+maxLots   = input.int(100, "Max lots per trade", minval = 1, group = gSize)
+
+// -----------------------------------------------------------------------------
+// Core series
+// -----------------------------------------------------------------------------
+ema = ta.ema(emaSrc, emaLen)
+atr = ta.atr(atrLen)
+
+htfEma = request.security(syminfo.tickerid, htf, ta.ema(close, htfEmaLen)[1],
+     lookahead = barmerge.lookahead_off)
+
+isIntraday  = timeframe.isintraday
+inEntryWin  = not useEntryWin or not isIntraday or not na(time(timeframe.period, entryWin, tz))
+inSqOff     = isIntraday and useSqOff and not na(time(timeframe.period, sqOffStr, tz))
+
+trendUpOk   = not useTrendFilter or na(htfEma) or close > htfEma
+trendDownOk = not useTrendFilter or na(htfEma) or close < htfEma
+
+// -----------------------------------------------------------------------------
+// Setup detection — the candle must be ENTIRELY on one side of the 5 EMA
+// -----------------------------------------------------------------------------
+candleRange = high - low
+rangeOk = (not useMaxRange or candleRange <= maxRangeAtr * atr) and
+     (not useMinRange or candleRange >= minRangeAtr * atr)
+
+sellCandle = low  > ema and candleRange > 0 and rangeOk
+buyCandle  = high < ema and candleRange > 0 and rangeOk
+
+// A candle that fails the side test kills the pending setup on that side.
+sellSideAlive = low  > ema
+buySideAlive  = high < ema
+
+// -----------------------------------------------------------------------------
+// Pending setup state
+// -----------------------------------------------------------------------------
+var bool  shortArmed   = false
+var float shortTrigger = na
+var float shortSl      = na
+var bool  longArmed    = false
+var float longTrigger  = na
+var float longSl       = na
+
+flat = strategy.position_size == 0
+
+// -- sell side ---------------------------------------------------------------
+if flat
+    if sellCandle and allowShort and trendDownOk
+        if not shortArmed or shiftRef
+            shortArmed   := true
+            shortTrigger := low
+            shortSl      := high
+    else if not sellSideAlive
+        shortArmed   := false
+        shortTrigger := na
+        shortSl      := na
+
+// -- buy side ----------------------------------------------------------------
+if flat
+    if buyCandle and allowLong and trendUpOk
+        if not longArmed or shiftRef
+            longArmed   := true
+            longTrigger := high
+            longSl      := low
+    else if not buySideAlive
+        longArmed   := false
+        longTrigger := na
+        longSl      := na
+
+// -----------------------------------------------------------------------------
+// Sizing — the reference candle's range IS the risk, known before entry
+// -----------------------------------------------------------------------------
+qtyFor(float stopDistance) =>
+    int q = math.min(fixedLots, maxLots) * lotSize
+    if sizeMode == "Risk %" and stopDistance > 0
+        riskAmt  = strategy.equity * riskPct / 100.0
+        rawUnits = riskAmt / stopDistance
+        lots     = math.floor(rawUnits / lotSize)
+        q := math.min(math.max(lots, 0), maxLots) * lotSize
+    q
+
+// -----------------------------------------------------------------------------
+// Order placement
+// -----------------------------------------------------------------------------
+wickMode  = breakMode == "Wick (resting stop order)"
+canArm    = flat and inEntryWin and not inSqOff and barstate.isconfirmed
+
+shortRisk = na(shortSl) or na(shortTrigger) ? na : shortSl - shortTrigger
+longRisk  = na(longSl)  or na(longTrigger)  ? na : longTrigger - longSl
+
+if canArm and shortArmed and not na(shortRisk) and shortRisk > 0
+    qty = qtyFor(shortRisk)
+    if qty > 0
+        if wickMode
+            strategy.entry("Short", strategy.short, qty = qty, stop = shortTrigger)
+        else if close < shortTrigger
+            strategy.entry("Short", strategy.short, qty = qty)
+else
+    strategy.cancel("Short")
+
+if canArm and longArmed and not na(longRisk) and longRisk > 0
+    qty = qtyFor(longRisk)
+    if qty > 0
+        if wickMode
+            strategy.entry("Long", strategy.long, qty = qty, stop = longTrigger)
+        else if close > longTrigger
+            strategy.entry("Long", strategy.long, qty = qty)
+else
+    strategy.cancel("Long")
+
+// Gap guard: if the bar opened well past the trigger, drop the setup rather
+// than chase a fill that is nowhere near the intended risk.
+if useGapGuard and flat and barstate.isconfirmed
+    if shortArmed and not na(shortTrigger) and open < shortTrigger - maxGapAtr * atr
+        strategy.cancel("Short")
+        shortArmed := false
+    if longArmed and not na(longTrigger) and open > longTrigger + maxGapAtr * atr
+        strategy.cancel("Long")
+        longArmed := false
+
+// -----------------------------------------------------------------------------
+// Live trade state — freeze the stop taken from the reference candle
+// -----------------------------------------------------------------------------
+var float activeSl    = na
+var float activeRisk  = na
+var float tp1Level    = na
+var float tp2Level    = na
+var float runnerStop  = na
+var float entryQty    = na
+var int   barsInTrade = 0
+
+justEntered = strategy.position_size != 0 and strategy.position_size[1] == 0
+
+if justEntered
+    avgEntry    = strategy.position_avg_price
+    isLong      = strategy.position_size > 0
+    activeSl    := isLong ? longSl : shortSl
+    activeRisk  := math.abs(avgEntry - activeSl)
+    tp1Level    := isLong ? avgEntry + rr1 * activeRisk : avgEntry - rr1 * activeRisk
+    tp2Level    := isLong ? avgEntry + rr2 * activeRisk : avgEntry - rr2 * activeRisk
+    runnerStop  := activeSl
+    entryQty    := math.abs(strategy.position_size)
+    barsInTrade := 0
+    shortArmed  := false
+    longArmed   := false
+else if strategy.position_size != 0
+    barsInTrade += 1
+
+tp1Done = strategy.position_size != 0 and not na(entryQty) and
+     math.abs(strategy.position_size) < entryQty
+
+// -----------------------------------------------------------------------------
+// Exits
+// -----------------------------------------------------------------------------
+if strategy.position_size > 0
+    avgL = strategy.position_avg_price
+    if tp1Done
+        candL = trailOnEma ? ema : runnerStop
+        runnerStop := math.max(nz(runnerStop, activeSl), avgL, nz(candL, avgL))
+    if usePartial
+        strategy.exit("L TP1",    from_entry = "Long", qty_percent = partialPct,
+             stop = activeSl, limit = tp1Level)
+        strategy.exit("L Runner", from_entry = "Long",
+             stop = tp1Done ? runnerStop : activeSl, limit = tp2Level)
+    else
+        strategy.exit("L Exit", from_entry = "Long", stop = activeSl, limit = tp1Level)
+
+if strategy.position_size < 0
+    avgS = strategy.position_avg_price
+    if tp1Done
+        candS = trailOnEma ? ema : runnerStop
+        runnerStop := math.min(nz(runnerStop, activeSl), avgS, nz(candS, avgS))
+    if usePartial
+        strategy.exit("S TP1",    from_entry = "Short", qty_percent = partialPct,
+             stop = activeSl, limit = tp1Level)
+        strategy.exit("S Runner", from_entry = "Short",
+             stop = tp1Done ? runnerStop : activeSl, limit = tp2Level)
+    else
+        strategy.exit("S Exit", from_entry = "Short", stop = activeSl, limit = tp1Level)
+
+if useTimeStop and strategy.position_size != 0 and barsInTrade >= timeStopBars and not tp1Done
+    strategy.close_all(comment = "Stalled")
+
+if inSqOff and strategy.position_size != 0
+    strategy.close_all(comment = "Square off")
+
+if strategy.position_size == 0
+    activeSl    := na
+    activeRisk  := na
+    tp1Level    := na
+    tp2Level    := na
+    runnerStop  := na
+    entryQty    := na
+    barsInTrade := 0
+
+// -----------------------------------------------------------------------------
+// Plots
+// -----------------------------------------------------------------------------
+plot(ema, "5 EMA", color = color.new(color.blue, 0), linewidth = 2)
+
+barcolor(sellCandle ? color.new(color.red, 0) : buyCandle ? color.new(color.green, 0) : na,
+     title = "Qualifying candle")
+
+plot(flat and shortArmed ? shortTrigger : na, "Sell trigger", color = color.new(color.red, 0),
+     style = plot.style_linebr, linewidth = 2)
+plot(flat and shortArmed ? shortSl : na, "Sell SL", color = color.new(color.maroon, 40),
+     style = plot.style_linebr)
+plot(flat and longArmed ? longTrigger : na, "Buy trigger", color = color.new(color.green, 0),
+     style = plot.style_linebr, linewidth = 2)
+plot(flat and longArmed ? longSl : na, "Buy SL", color = color.new(color.olive, 40),
+     style = plot.style_linebr)
+
+plot(strategy.position_size != 0 ? (tp1Done ? runnerStop : activeSl) : na, "Active stop",
+     color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? tp1Level : na, "Target 1",
+     color = color.new(color.green, 0), style = plot.style_linebr)
+plot(strategy.position_size != 0 and usePartial ? tp2Level : na, "Runner target",
+     color = color.new(color.teal, 30), style = plot.style_linebr)
+
+plotshape(flat and sellCandle and allowShort, "Sell setup", style = shape.triangledown,
+     location = location.abovebar, color = color.new(color.red, 0), size = size.tiny)
+plotshape(flat and buyCandle and allowLong, "Buy setup", style = shape.triangleup,
+     location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
+
+alertcondition(sellCandle, "5 EMA sell setup formed",
+     "5 EMA sell setup on {{ticker}} — sell below {{low}}, SL {{high}}")
+alertcondition(buyCandle, "5 EMA buy setup formed",
+     "5 EMA buy setup on {{ticker}} — buy above {{high}}, SL {{low}}")

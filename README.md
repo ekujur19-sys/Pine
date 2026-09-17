@@ -1,7 +1,7 @@
-# Pine — Nifty 50 Intraday Strategies
+# Pine — Nifty 50 / Indian Market Strategies
 
-Four self-contained Pine Script **v6** strategies for NIFTY 50, written for NSE
-session hours (IST) with mandatory intraday square-off, ATR-based risk, and
+Five self-contained Pine Script **v6** strategies for NIFTY 50, written for NSE
+session hours (IST) with ATR-based risk, session square-off, and
 lot-rounded position sizing.
 
 | File | Setup | Best timeframe | Trades/day | Market it needs |
@@ -10,9 +10,10 @@ lot-rounded position sizing.
 | `strategies/nifty50_vwap_pullback.pine` | VWAP trend pullback | 5m–15m | 0–3 | Trending day |
 | `strategies/nifty50_supertrend_momentum.pine` | Supertrend flip out of a squeeze | 5m–15m | 0–3 | Range → expansion |
 | `strategies/nifty50_trend_strategy.pine` | EMA cross + ADX, ATR trail | 15m–1h / daily | Few | Sustained trend |
+| `strategies/nifty50_5ema_power_of_stocks.pine` | 5 EMA fade (Power of Stocks) | 15m–1h / daily | 0–2 | Overextended move |
 
 They are deliberately different in *character*, not just in indicator. Running
-all four on the same day is not diversification — ORB and Supertrend will often
+them all on the same day is not diversification — ORB and Supertrend will often
 fire on the same move. Pick the one that matches the day type you actually trade.
 
 ---
@@ -79,7 +80,44 @@ tests, lowers expectancy.
 
 ---
 
-## 4. EMA + ADX Trend (higher timeframe)
+## 4. 5 EMA Strategy (Power of Stocks)
+
+Subhasish Pani's setup, implemented as taught, with the common variations
+exposed as toggles rather than baked in.
+
+**Rules.**
+- **Sell:** a candle whose **low is entirely above** the 5 EMA. Sell stop at
+  that candle's **low**, SL at its **high**.
+- **Buy:** a candle whose **high is entirely below** the 5 EMA. Buy stop at
+  that candle's **high**, SL at its **low**.
+- While the setup lives, each new qualifying candle **replaces** the reference —
+  trigger and stop both shift (`shiftRef`, on by default).
+- The moment a candle touches the 5 EMA, the setup is dead and the resting
+  order is cancelled.
+- Default exit is partial at 2R with the runner trailed on the 5 EMA.
+
+**The two settings that change everything.**
+- `breakMode` — *Wick* rests a real stop order at the level and fills intrabar,
+  which is how it is taught. *Candle close beyond level* waits for confirmation.
+  These backtest as two different strategies: wick triggers far more often and
+  stops out more; close misses the fast moves entirely. Test both before you
+  decide which one you are actually trading.
+- `useTrendFilter` — **off by default, and off is the original strategy.** In
+  pure form this setup is *counter-trend*: a run of candles fully above the 5
+  EMA is by definition a strong uptrend, and the rules short into it. That is
+  the source of both the outsized winners and the losing streaks. The filter
+  lets you measure the "only trade with the higher timeframe" variant against
+  the real rules instead of assuming it helps.
+
+**Other notes.** `lotSize` defaults to 1 for cash stocks — set it to 75 for
+NIFTY futures. The reference candle's range *is* your risk, so risk-% sizing
+hands you a small quantity after a wide candle; that is the model working, not
+a bug. Below 15m the 5 EMA gets touched almost every candle and very few setups
+survive to trigger.
+
+---
+
+## 5. EMA + ADX Trend (higher timeframe)
 
 Not really an intraday scalper — this is the 15m/1h/daily positional variant.
 EMA 20/50 cross, filtered by a 200 EMA regime and ADX ≥ 20, with an ATR initial
@@ -91,7 +129,8 @@ auto-disables on daily charts.
 ## Common mechanics (all four)
 
 - **Sizing.** `Risk %` mode risks a fixed % of equity across the stop distance,
-  then rounds *down* to whole lots. Default lot size is **75** — update
+  then rounds *down* to whole lots. Default lot size is **75** for the NIFTY
+  strategies (**1** for the 5 EMA one, which is stock-oriented) — update
   `lotSize` if the NSE contract spec changes. 1 index point = ₹1 per unit.
 - **Session.** Entry windows default to `0930-1430`; square-off `1515-1525`.
   All session logic is timezone-pinned to `Asia/Kolkata`, so it is correct
